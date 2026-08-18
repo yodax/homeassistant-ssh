@@ -17,8 +17,11 @@ import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    ATTR_AREA_ID,
     ATTR_DEVICE_ID,
     ATTR_ENTITY_ID,
+    ATTR_FLOOR_ID,
+    ATTR_LABEL_ID,
     CONF_COMMAND,
     CONF_HOST,
     CONF_MAC,
@@ -32,6 +35,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import (
     HomeAssistant,
+    HomeAssistantError,
     ServiceCall,
     ServiceResponse,
     ServiceValidationError,
@@ -106,13 +110,24 @@ DEVICE_SENSOR_KEYS = [
     SensorKey.TOTAL_MEMORY,
 ]
 
+# services.yaml declares a full target selector, so the frontend can send
+# area_id / floor_id / label_id as well as device_id / entity_id. A plain
+# vol.Schema defaults to PREVENT_EXTRA and rejected those outright, which made
+# picking an area in the service dialog fail with "extra keys not allowed".
+TARGET_FIELDS = {
+    vol.Optional(ATTR_AREA_ID): vol.Any(str, list),
+    vol.Optional(ATTR_DEVICE_ID): vol.Any(str, list),
+    vol.Optional(ATTR_ENTITY_ID): vol.Any(str, list),
+    vol.Optional(ATTR_FLOOR_ID): vol.Any(str, list),
+    vol.Optional(ATTR_LABEL_ID): vol.Any(str, list),
+}
+
 EXECUTE_COMMAND_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_COMMAND): str,
         vol.Optional(CONF_TIMEOUT): int,
         vol.Optional(CONF_VARIABLES): dict,
-        vol.Optional(ATTR_DEVICE_ID): list,
-        vol.Optional(ATTR_ENTITY_ID): list,
+        **TARGET_FIELDS,
     }
 )
 
@@ -120,15 +135,15 @@ RUN_ACTION_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_KEY): str,
         vol.Optional(CONF_VARIABLES): dict,
-        vol.Optional(ATTR_DEVICE_ID): list,
-        vol.Optional(ATTR_ENTITY_ID): list,
+        **TARGET_FIELDS,
     }
 )
 
 SET_VALUE_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_VALUES): list,
-        vol.Required(ATTR_ENTITY_ID): list,
+        vol.Required(ATTR_ENTITY_ID): vol.Any(str, list),
+        **{key: value for key, value in TARGET_FIELDS.items() if key != ATTR_ENTITY_ID},
     }
 )
 
@@ -237,11 +252,18 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    entry_data: EntryData = hass.data[entry.domain][entry.entry_id]
+    # Setup can fail before hass.data is populated - loading host keys is the
+    # usual culprit - and HA still unloads the entry afterwards. Indexing
+    # directly raised a KeyError that masked the original setup error.
+    entry_data: EntryData | None = hass.data.get(entry.domain, {}).get(entry.entry_id)
+
+    if entry_data is None:
+        return True
+
     platforms = entry_data.platforms
 
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, platforms):
-        hass.data[entry.domain].pop(entry.entry_id)
+        hass.data[entry.domain].pop(entry.entry_id, None)
         await entry_data.async_shutdown()
 
     return unload_ok
@@ -264,6 +286,8 @@ async def async_initialize_entry(
         SensorCommandCoordinator(hass, manager, command)
         for command in manager.sensor_commands
     ]
+
+    async_warn_about_never_refreshing_commands(manager)
 
     entry_data = EntryData(
         entry,
@@ -299,6 +323,43 @@ async def async_initialize_entry(
             sensor.on_update.subscribe(handle_device_sensor_update)
 
     await hass.config_entries.async_forward_entry_setups(entry, platforms)
+
+
+def async_warn_about_never_refreshing_commands(manager: SSHManager) -> None:
+    """Log sensor commands that will only ever run once.
+
+    A sensor command with no scan_interval gets a coordinator with
+    update_interval=None, and HA never arms a refresh timer for it. The
+    manager's own periodic update skips any command that has already produced
+    output, so the command runs once per entry load and then never again while
+    its entities stay available and keep showing the startup value.
+
+    That is the right behaviour for static facts (uname, dmidecode, cpuinfo),
+    and a silently dead signal for anything that can change - a pool health or
+    backup status check reads healthy forever. Neither the UI nor the log said
+    so, which is the part worth fixing here.
+    """
+    static_keys = set(DEVICE_SENSOR_KEYS) | {
+        SensorKey.HOSTNAME,
+        SensorKey.MAC_ADDRESS,
+        SensorKey.WAKE_ON_LAN,
+        SensorKey.NETWORK_INTERFACE,
+        SensorKey.SERIAL_NUMBER,
+    }
+
+    for command in manager.sensor_commands:
+        if command.interval:
+            continue
+        keys = [sensor.key for sensor in command.sensors]
+        if all(key in static_keys for key in keys):
+            continue
+        _LOGGER.warning(
+            "%s: sensor command for %s has no scan interval, so it runs once at "
+            "startup and never refreshes. Set a scan interval, or poll it with "
+            "the ssh.poll_sensor action, if its value can change",
+            manager.name,
+            ", ".join(keys),
+        )
 
 
 def get_targeted_entry_data(
@@ -345,11 +406,30 @@ def async_register_services(hass: HomeAssistant, domain: str):
                     for entry_data in get_targeted_entry_data(hass, domain, entry_ids)
                 )
             )
-            return (
-                {"results": [result for results in data for result in results]}
-                if call.return_response
-                else None
-            )
+            results = [result for results in data for result in results]
+
+            # Without a response_variable the caller never sees these results,
+            # so a failure would otherwise be discarded in silence: the calling
+            # script carries on as if the remote command had run. Log every
+            # failure, and raise when nobody is going to read the response.
+            if failures := [result for result in results if not result["success"]]:
+                for failure in failures:
+                    _LOGGER.error(
+                        "%s failed on %s: %s",
+                        call.service,
+                        failure.get("device_name") or failure.get("entity_name"),
+                        failure.get("error", "unknown error"),
+                    )
+                if not call.return_response:
+                    raise HomeAssistantError(
+                        f"{call.service} failed: "
+                        + "; ".join(
+                            failure.get("error", "unknown error")
+                            for failure in failures
+                        )
+                    )
+
+            return {"results": results} if call.return_response else None
 
         return wrapper
 
@@ -366,15 +446,24 @@ def async_register_services(hass: HomeAssistant, domain: str):
                     "error": str(exc),
                 }
             else:
+                # A command that ran but exited non-zero is a failed command.
+                # Upstream reported success for any exit code, so an action
+                # button wired to a script that errors out looked like it had
+                # worked.
                 result = {
                     "device_id": entry_data.device_entry.id,
                     "device_name": entry_data.device_entry.name,
-                    "success": True,
+                    "success": output.code == 0,
                     "command": output.command_string,
                     "stdout": output.stdout,
                     "stderr": output.stderr,
                     "code": output.code,
                 }
+                if output.code != 0:
+                    result["error"] = (
+                        "\n".join(output.stderr)
+                        or f"command exited with code {output.code}"
+                    )
             return [result]
 
         return wrapper
