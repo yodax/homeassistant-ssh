@@ -272,11 +272,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
-async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload a config entry."""
-    await hass.config_entries.async_reload(entry.entry_id)
-
-
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     # Setup can fail before hass.data is populated - loading host keys is the
@@ -326,8 +321,9 @@ async def async_initialize_entry(
         ignored_sensor_keys,
     )
 
-    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
-
+    # No update listener here on purpose: the options flow subclasses
+    # OptionsFlowWithReload, which reloads the entry itself. Registering both
+    # reloaded twice per change and is refused by HA from 2026.12.
     hass.data.setdefault(entry.domain, {})
     hass.data[entry.domain][entry.entry_id] = entry_data
 

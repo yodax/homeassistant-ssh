@@ -367,8 +367,17 @@ OPTIONS_FLOW_RESET_COMMANDS_SCHEMA = vol.Schema(
 )
 
 
-class OptionsFlow(config_entries.OptionsFlow):
-    """Handle a options flow for SSH."""
+class OptionsFlow(config_entries.OptionsFlowWithReload):
+    """Handle a options flow for SSH.
+
+    OptionsFlowWithReload reloads the entry itself when the options change.
+    That replaces the config entry update listener the integration used to
+    register: keeping both made every options save and every reauth/reconfigure
+    reload the entry twice - two SSH teardown/reconnect cycles and two full
+    entity re-adds per change - and Home Assistant reports the combination for
+    removal in 2026.12. The two are mutually exclusive; do not reintroduce
+    add_update_listener alongside this.
+    """
 
     logger = _LOGGER
 
