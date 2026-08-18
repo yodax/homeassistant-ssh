@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from ssh_terminal_manager import (
     AuthenticationError,
+    Command,
     CommandOutput,
     ConnectError,
     ExecutionError,
@@ -23,6 +24,53 @@ if TYPE_CHECKING:
     from .entry_data import EntryData
 
 FAST_UPDATE_INTERVAL = timedelta(seconds=1)
+
+
+def get_failed_exit_code(command: Command) -> int | None:
+    """Return the exit code of a command that ran but failed, if it did.
+
+    terminal_manager treats any command that ran as a success whatever its exit
+    code - `error` stays None - and then clears every sensor value the command
+    feeds. So a health check that starts exiting non-zero blanks its sensors
+    while reporting no error at all. This is how that case is recognised.
+    """
+    if (output := command.output) is None or output.code == 0:
+        return None
+    return output.code
+
+
+def log_failed_exit_code(command: Command, name: str, logger) -> None:
+    """Log once when a sensor command starts failing, and once when it recovers.
+
+    Every trace in this integration goes to debug, which is not viable to enable
+    at homelab command volume, so a command that quietly started failing left no
+    usable signal anywhere.
+    """
+    code = get_failed_exit_code(command)
+    previously_failing = getattr(command, "_ssh_failing", False)
+
+    if code is None:
+        if previously_failing:
+            command._ssh_failing = False  # noqa: SLF001
+            logger.warning(
+                "%s: sensor command for %s recovered",
+                name,
+                ", ".join(sensor.key for sensor in command.sensors),
+            )
+        return
+
+    if previously_failing:
+        return
+
+    command._ssh_failing = True  # noqa: SLF001
+    logger.warning(
+        "%s: sensor command for %s exited with code %s, so its sensors have been "
+        "cleared and will read unknown until it succeeds again%s",
+        name,
+        ", ".join(sensor.key for sensor in command.sensors),
+        code,
+        f": {'; '.join(command.output.stderr)}" if command.output.stderr else "",
+    )
 
 
 class BaseCoordinator(DataUpdateCoordinator):
@@ -67,6 +115,8 @@ class BaseCoordinator(DataUpdateCoordinator):
 
 
 class StateCoordinator(BaseCoordinator):
+    _unreachable = False
+
     def __init__(
         self,
         hass: HomeAssistant,
@@ -86,10 +136,26 @@ class StateCoordinator(BaseCoordinator):
             await self._manager.async_update(once=True, test=True)
         except AuthenticationError as exc:
             raise ConfigEntryAuthFailed(exc) from exc
-        except (OfflineError, ConnectError, ExecutionError):
-            pass
+        except (OfflineError, ConnectError, ExecutionError) as exc:
+            # Swallowed on purpose - a powered-off host is a normal state for
+            # this integration, which is built to wake hosts over the network.
+            # But saying nothing at all is how a host that is down by accident
+            # stays unnoticed for hours, so log the transition. Once per
+            # outage, not once per poll, and at info level because "off" is
+            # expected for some of these hosts.
+            if not self._unreachable:
+                self._unreachable = True
+                self.logger.info(
+                    "%s is unreachable, its entities are now unavailable: %s",
+                    self._manager.name,
+                    exc,
+                )
         except Exception as exc:
             raise UpdateFailed(f"Exception updating {self.name}: {exc}") from exc
+        else:
+            if self._unreachable:
+                self._unreachable = False
+                self.logger.info("%s is reachable again", self._manager.name)
 
         if self._manager.state.request:
             self.update_interval = FAST_UPDATE_INTERVAL
@@ -171,3 +237,5 @@ class SensorCommandCoordinator(BaseCoordinator):
             pass
         except Exception as exc:
             raise UpdateFailed(f"Exception updating {self.name}: {exc}") from exc
+        else:
+            log_failed_exit_code(self._command, self._manager.name, self.logger)

@@ -76,7 +76,11 @@ from .const import (
     SERVICE_TURN_ON,
 )
 from .converter import Converter
-from .coordinator import SensorCommandCoordinator, StateCoordinator
+from .coordinator import (
+    SensorCommandCoordinator,
+    StateCoordinator,
+    get_failed_exit_code,
+)
 from .entry_data import EntryData
 from .helpers import (
     get_command_renderer,
@@ -408,6 +412,42 @@ def get_targeted_entities(
     )
 
 
+def get_poll_result(
+    entry_data: EntryData, entity: BaseSensorEntity, error: Exception | None
+) -> dict:
+    """Build the result row for one polled sensor.
+
+    A sensor command that runs but exits non-zero is reported by
+    terminal_manager as a success with no error, while it clears every sensor
+    value that command feeds. Reporting that as a successful poll is how a
+    health check can go to `unknown` and still look fine to whoever polled it.
+    """
+    result = {
+        "entity_id": entity.entity_id,
+        "entity_name": entity.name,
+        "success": error is None,
+    }
+
+    if error is not None:
+        result["error"] = str(error)
+        return result
+
+    try:
+        command = entry_data.manager.get_sensor_command(entity.key)
+    except KeyError:
+        return result
+
+    if (code := get_failed_exit_code(command)) is not None:
+        result["success"] = False
+        result["code"] = code
+        result["error"] = (
+            "; ".join(command.output.stderr)
+            or f"sensor command exited with code {code}; the sensor value was cleared"
+        )
+
+    return result
+
+
 def get_unavailable_results(entities: list[BaseSensorEntity]) -> list[dict]:
     """Build failure rows for targeted entities that could not be reached."""
     return [
@@ -587,12 +627,7 @@ def async_register_services(hass: HomeAssistant, domain: str):
             raise_errors=False,
         )
         return [
-            {
-                "entity_id": entity.entity_id,
-                "entity_name": entity.name,
-                "success": (error := errors[i]) is None,
-                **({"error": str(error)} if error else {}),
-            }
+            get_poll_result(entry_data, entity, errors[i])
             for i, entity in enumerate(selected_entities)
         ] + get_unavailable_results(unavailable_entities)
 
