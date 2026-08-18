@@ -301,15 +301,49 @@ async def async_initialize_entry(
     await hass.config_entries.async_forward_entry_setups(entry, platforms)
 
 
+def get_targeted_entry_data(
+    hass: HomeAssistant, domain: str, entry_ids: set[str]
+) -> list[EntryData]:
+    """Return the loaded entry data for the targeted config entries.
+
+    A device can carry config entries belonging to other integrations - template
+    helpers assigned to the SSH device for organisation are the common case - and
+    an SSH entry can exist but not be loaded. Indexing hass.data blindly raised a
+    bare KeyError in both situations.
+    """
+    domain_data = hass.data.get(domain, {})
+
+    if entry_data := [
+        domain_data[entry_id] for entry_id in entry_ids if entry_id in domain_data
+    ]:
+        return entry_data
+
+    if any(
+        (entry := hass.config_entries.async_get_entry(entry_id))
+        and entry.domain == domain
+        for entry_id in entry_ids
+    ):
+        raise ServiceValidationError(
+            f"The targeted {domain} config entry is not loaded"
+        )
+
+    raise ServiceValidationError(
+        f"No loaded {domain} config entry found for the specified target"
+    )
+
+
 def async_register_services(hass: HomeAssistant, domain: str):
     """Register the domain services."""
 
     def get_response(coro: Coroutine):
         @wraps(coro)
         async def wrapper(call: ServiceCall) -> ServiceResponse | None:
-            entry_ids = await async_extract_config_entry_ids(hass, call)
+            entry_ids = await async_extract_config_entry_ids(call)
             data = await asyncio.gather(
-                *(coro(hass.data[domain][entry_id], call) for entry_id in entry_ids)
+                *(
+                    coro(entry_data, call)
+                    for entry_data in get_targeted_entry_data(hass, domain, entry_ids)
+                )
             )
             return (
                 {"results": [result for results in data for result in results]}
@@ -396,7 +430,7 @@ def async_register_services(hass: HomeAssistant, domain: str):
             if isinstance(entity, BaseSensorEntity)
             and entity.coordinator == entry_data.state_coordinator
         ]
-        selected_entities = await async_extract_entities(hass, entities, call)
+        selected_entities = await async_extract_entities(entities, call)
         sensor_keys = [entity.key for entity in selected_entities]
         sensors, errors = await entry_data.manager.async_poll_sensors(
             sensor_keys,
@@ -422,7 +456,7 @@ def async_register_services(hass: HomeAssistant, domain: str):
             if isinstance(entity, BaseSensorEntity)
             and entity.coordinator == entry_data.state_coordinator
         ]
-        selected_entities = await async_extract_entities(hass, entities, call)
+        selected_entities = await async_extract_entities(entities, call)
         if len(selected_entities) > len(values):
             raise ServiceValidationError("Not all values provided")
         sensor_keys = [entity.key for entity in selected_entities]
