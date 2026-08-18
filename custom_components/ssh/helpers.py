@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import lru_cache
 
 from ssh_terminal_manager import Sensor, SensorKey, SSHManager
 
@@ -14,18 +15,28 @@ from .base_entity import BaseSensorEntity
 from .entry_data import EntryData
 
 
+@lru_cache(maxsize=512)
+def _get_template(template_string: str, hass: HomeAssistant) -> Template:
+    """Compile a template once instead of on every render.
+
+    Command strings are rendered on every poll of every command, so this was
+    recompiling the same templates hundreds of times a minute.
+    """
+    return Template(template_string, hass)
+
+
 def get_command_renderer(hass: HomeAssistant) -> Callable:
     def async_renderer(command_string):
-        template = Template(command_string, hass)
-        return template.async_render(parse_result=False)
+        return _get_template(command_string, hass).async_render(parse_result=False)
 
     return async_renderer
 
 
 def get_value_renderer(hass: HomeAssistant, value_template: str) -> Callable:
     def async_renderer(value: str):
-        template = Template(value_template, hass)
-        return template.async_render(variables={"value": value}, parse_result=False)
+        return _get_template(value_template, hass).async_render(
+            variables={"value": value}, parse_result=False
+        )
 
     return async_renderer
 
@@ -100,10 +111,23 @@ def get_device_sensor_update_handler(
     device_registry: DeviceRegistry,
 ) -> Callable:
     def async_handler(sensor: Sensor):
-        if sensor.value is not None:
+        if sensor.value is None:
+            return
+        try:
             device_registry.async_update_device(
                 entry_data.device_entry.id,
                 **get_device_info(entry_data.manager),
+            )
+        except Exception:  # noqa: BLE001
+            # terminal_manager's Event.notify iterates subscribers with no
+            # try/except, so raising here silently stops every sensor after this
+            # one in the same command from updating - every cycle, until reload.
+            # Reachable by deleting the SSH device while its entry still exists.
+            entry_data.state_coordinator.logger.warning(
+                "%s: could not update device info, its device entry may have "
+                "been removed",
+                entry_data.manager.name,
+                exc_info=True,
             )
 
     return async_handler

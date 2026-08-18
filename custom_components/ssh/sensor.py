@@ -19,7 +19,11 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 
 from .base_entity import BaseSensorEntity
-from .const import CONF_SUGGESTED_DISPLAY_PRECISION, CONF_SUGGESTED_UNIT_OF_MEASUREMENT
+from .const import (
+    CONF_STATE_CLASS,
+    CONF_SUGGESTED_DISPLAY_PRECISION,
+    CONF_SUGGESTED_UNIT_OF_MEASUREMENT,
+)
 from .entry_data import EntryData
 from .helpers import get_child_add_handler, get_child_remove_handler
 
@@ -77,6 +81,12 @@ class Entity(BaseSensorEntity, SensorEntity):
 
     @property
     def state_class(self) -> SensorStateClass | None:
+        # Hardcoding MEASUREMENT made counter-style sensors impossible: HA
+        # rejects it for device classes whose valid state classes are total or
+        # total_increasing (energy, gas, water, monetary), so an energy or
+        # bytes-transferred counter could not be built at all.
+        if configured := self._attributes.get(CONF_STATE_CLASS):
+            return SensorStateClass(configured)
         if isinstance(self._sensor, NumberSensor):
             return SensorStateClass.MEASUREMENT
         return None

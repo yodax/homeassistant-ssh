@@ -6,7 +6,7 @@ from ssh_terminal_manager import TextSensor
 
 from homeassistant.components.text import ENTITY_ID_FORMAT, TextEntity, TextMode
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_MODE
+from homeassistant.const import CONF_MODE, MAX_LENGTH_STATE_STATE
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_platform
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -68,7 +68,9 @@ class Entity(BaseSensorEntity, TextEntity):
     def native_max(self) -> int:
         if self._sensor.maximum is not None:
             return int(self._sensor.maximum)
-        return 100
+        # HA's own default, and the hard cap on a state string. Defaulting to
+        # 100 rejected 101-255 character values that HA would have accepted.
+        return MAX_LENGTH_STATE_STATE
 
     @property
     def native_min(self) -> int:
