@@ -31,6 +31,7 @@ from homeassistant.const import (
     CONF_TIMEOUT,
     CONF_USERNAME,
     CONF_VARIABLES,
+    ENTITY_MATCH_ALL,
     Platform,
 )
 from homeassistant.core import (
@@ -41,11 +42,12 @@ from homeassistant.core import (
     ServiceValidationError,
     SupportsResponse,
 )
-from homeassistant.helpers import device_registry as dr, entity_platform
-from homeassistant.helpers.service import (
-    async_extract_config_entry_ids,
-    async_extract_entities,
+from homeassistant.helpers import (
+    device_registry as dr,
+    entity_platform,
+    target as target_helpers,
 )
+from homeassistant.helpers.service import async_extract_config_entry_ids
 
 from .base_entity import BaseSensorEntity
 from .const import (
@@ -377,6 +379,48 @@ def async_warn_about_never_refreshing_commands(manager: SSHManager) -> None:
         )
 
 
+def get_targeted_entities(
+    hass: HomeAssistant,
+    entities: list[BaseSensorEntity],
+    call: ServiceCall,
+) -> tuple[list[BaseSensorEntity], list[BaseSensorEntity]]:
+    """Split the entities a call targets into available and unavailable.
+
+    async_extract_entities drops unavailable entities silently. Every entity of
+    an entry is unavailable while its host is unreachable, so a poll against a
+    host that is down resolved to an empty selection and returned an empty
+    result set - indistinguishable from a successful poll. The caller has to be
+    able to tell those apart, so return the dropped ones rather than discarding
+    them.
+    """
+    if call.data.get(ATTR_ENTITY_ID) == ENTITY_MATCH_ALL:
+        matched = list(entities)
+    else:
+        referenced = target_helpers.async_extract_referenced_entity_ids(
+            hass, target_helpers.TargetSelection(call.data), True
+        )
+        combined = referenced.referenced | referenced.indirectly_referenced
+        matched = [entity for entity in entities if entity.entity_id in combined]
+
+    return (
+        [entity for entity in matched if entity.available],
+        [entity for entity in matched if not entity.available],
+    )
+
+
+def get_unavailable_results(entities: list[BaseSensorEntity]) -> list[dict]:
+    """Build failure rows for targeted entities that could not be reached."""
+    return [
+        {
+            "entity_id": entity.entity_id,
+            "entity_name": entity.name,
+            "success": False,
+            "error": "entity is unavailable, the host may be unreachable",
+        }
+        for entity in entities
+    ]
+
+
 def get_targeted_entry_data(
     hass: HomeAssistant, domain: str, entry_ids: set[str]
 ) -> list[EntryData]:
@@ -534,7 +578,9 @@ def async_register_services(hass: HomeAssistant, domain: str):
             if isinstance(entity, BaseSensorEntity)
             and entity.coordinator == entry_data.state_coordinator
         ]
-        selected_entities = await async_extract_entities(entities, call)
+        selected_entities, unavailable_entities = get_targeted_entities(
+            hass, entities, call
+        )
         sensor_keys = [entity.key for entity in selected_entities]
         sensors, errors = await entry_data.manager.async_poll_sensors(
             sensor_keys,
@@ -548,7 +594,7 @@ def async_register_services(hass: HomeAssistant, domain: str):
                 **({"error": str(error)} if error else {}),
             }
             for i, entity in enumerate(selected_entities)
-        ]
+        ] + get_unavailable_results(unavailable_entities)
 
     @get_response
     async def set_value(entry_data: EntryData, call: ServiceCall) -> list[dict]:
@@ -560,9 +606,23 @@ def async_register_services(hass: HomeAssistant, domain: str):
             if isinstance(entity, BaseSensorEntity)
             and entity.coordinator == entry_data.state_coordinator
         ]
-        selected_entities = await async_extract_entities(entities, call)
-        if len(selected_entities) > len(values):
-            raise ServiceValidationError("Not all values provided")
+        selected_entities, unavailable_entities = get_targeted_entities(
+            hass, entities, call
+        )
+        # Values are paired with entities by index. Dropping an unavailable
+        # entity from the middle of the selection shifted every later value onto
+        # the wrong sensor, silently, and the old length guard only caught the
+        # case where there were too few values.
+        if unavailable_entities:
+            raise ServiceValidationError(
+                "Cannot set values while these entities are unavailable: "
+                + ", ".join(entity.entity_id for entity in unavailable_entities)
+            )
+        if len(selected_entities) != len(values):
+            raise ServiceValidationError(
+                f"Got {len(values)} values for {len(selected_entities)} entities; "
+                "provide exactly one value per targeted entity"
+            )
         sensor_keys = [entity.key for entity in selected_entities]
         sensors, errors = await entry_data.manager.async_set_sensor_values(
             sensor_keys,
