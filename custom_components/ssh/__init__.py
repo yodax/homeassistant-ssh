@@ -122,6 +122,33 @@ TARGET_FIELDS = {
     vol.Optional(ATTR_LABEL_ID): vol.Any(str, list),
 }
 
+# Stock sensors whose value cannot change while the host is up, so a sensor
+# command without a scan interval is correct for them and must not be warned
+# about. Everything else in SensorKey (cpu_load, free_memory, free_disk_space,
+# processes, temperature) can change, as can any user-defined sensor.
+STATIC_SENSOR_KEYS = frozenset(
+    {
+        SensorKey.CPU_CORES,
+        SensorKey.CPU_HARDWARE,
+        SensorKey.CPU_MODEL,
+        SensorKey.CPU_NAME,
+        SensorKey.DEVICE_MODEL,
+        SensorKey.DEVICE_NAME,
+        SensorKey.HOSTNAME,
+        SensorKey.MACHINE_TYPE,
+        SensorKey.MAC_ADDRESS,
+        SensorKey.MANUFACTURER,
+        SensorKey.NETWORK_INTERFACE,
+        SensorKey.OS_ARCHITECTURE,
+        SensorKey.OS_NAME,
+        SensorKey.OS_RELEASE,
+        SensorKey.OS_VERSION,
+        SensorKey.SERIAL_NUMBER,
+        SensorKey.TOTAL_MEMORY,
+        SensorKey.WAKE_ON_LAN,
+    }
+)
+
 EXECUTE_COMMAND_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_COMMAND): str,
@@ -339,19 +366,11 @@ def async_warn_about_never_refreshing_commands(manager: SSHManager) -> None:
     backup status check reads healthy forever. Neither the UI nor the log said
     so, which is the part worth fixing here.
     """
-    static_keys = set(DEVICE_SENSOR_KEYS) | {
-        SensorKey.HOSTNAME,
-        SensorKey.MAC_ADDRESS,
-        SensorKey.WAKE_ON_LAN,
-        SensorKey.NETWORK_INTERFACE,
-        SensorKey.SERIAL_NUMBER,
-    }
-
     for command in manager.sensor_commands:
         if command.interval:
             continue
         keys = [sensor.key for sensor in command.sensors]
-        if all(key in static_keys for key in keys):
+        if all(key in STATIC_SENSOR_KEYS for key in keys):
             continue
         _LOGGER.warning(
             "%s: sensor command for %s has no scan interval, so it runs once at "
