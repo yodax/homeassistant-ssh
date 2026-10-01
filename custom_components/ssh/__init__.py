@@ -11,7 +11,6 @@ from ssh_terminal_manager import (
     CommandOutput,
     SensorKey,
     SSHManager,
-    SSHTerminal,
 )
 import voluptuous as vol
 
@@ -87,6 +86,7 @@ from .helpers import (
     get_device_info,
     get_device_sensor_update_handler,
 )
+from .terminal import TolerantSSHTerminal
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -241,7 +241,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     data = entry.data
     options = entry.options
 
-    terminal = SSHTerminal(
+    terminal = TolerantSSHTerminal(
         data[CONF_HOST],
         port=data[CONF_PORT],
         username=data.get(CONF_USERNAME),

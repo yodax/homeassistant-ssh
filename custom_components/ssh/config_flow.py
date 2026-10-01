@@ -23,7 +23,6 @@ from ssh_terminal_manager import (
     OfflineError,
     SensorError,
     SSHManager,
-    SSHTerminal,
     default_collections,
 )
 import voluptuous as vol
@@ -124,6 +123,7 @@ from .const import (
     DOMAIN,
 )
 from .converter import Converter
+from .terminal import TolerantSSHTerminal
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -620,7 +620,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_validate_user(self, data: dict) -> tuple[dict, dict]:
         """Validate the config user input."""
-        terminal = SSHTerminal(
+        terminal = TolerantSSHTerminal(
             data[CONF_HOST],
             port=data[CONF_PORT],
             username=data.get(CONF_USERNAME),
